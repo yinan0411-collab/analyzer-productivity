@@ -11,6 +11,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class AnalysisParams:
+    two_b_keyword: str = "2B"
     oversized_order_threshold: int = 500
     high_area_start: int = 1
     high_area_end: int = 36
@@ -36,27 +37,10 @@ PICK_REQUIRED = [
     "姓名",
 ]
 
-TRAFILEA_OWNER_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("Walmart", r"\bwalmart\b"),
-    ("Belk", r"\bbelk\b"),
-    ("Kohl's", r"\bkohl\s*['’`-]?\s*s\b"),
-    # Also tolerate the common misspelling “Kolh's”.
-    ("Kohl's", r"\bkolh\s*['’`-]?\s*s\b"),
-    ("Nordstrom", r"\bnordstrom\b"),
-)
-
-NORMAL_2B_SPB_KEYS = {
-    "ww 2b self pick up",
-    "ww pick first transport",
-}
-
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
-    # Accept either naming convention for the owner-name field.
-    if "货主名称" not in out.columns and "货主名" in out.columns:
-        out = out.rename(columns={"货主名": "货主名称"})
     return out
 
 
@@ -71,27 +55,9 @@ def read_excel(source) -> pd.DataFrame:
     return normalize_columns(pd.read_excel(source, sheet_name=0, engine="openpyxl"))
 
 
-def _normalized_key(value: object) -> str:
-    """Normalize case, punctuation, apostrophes and repeated spaces for exact-name rules."""
-    if pd.isna(value):
-        return ""
-    text = str(value).casefold().replace("’", "'").replace("`", "'")
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
-
-
-def _trafilea_owner(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    text = str(value).casefold().replace("’", "'").replace("`", "'")
-    for canonical_name, pattern in TRAFILEA_OWNER_PATTERNS:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return canonical_name
-    return ""
-
-
-def _is_normal_2b_spb(value: object) -> bool:
-    return _normalized_key(value) in NORMAL_2B_SPB_KEYS
+def _contains_2b(value: object, keyword: str) -> bool:
+    text = "" if pd.isna(value) else str(value)
+    return keyword.casefold() in text.casefold()
 
 
 def _cancelled_mask(series: pd.Series) -> pd.Series:
@@ -104,10 +70,6 @@ def prepare_exam(exam_raw: pd.DataFrame, params: AnalysisParams) -> pd.DataFrame
     require_columns(exam, EXAM_REQUIRED, "考核单")
 
     exam = exam.copy()
-    if "货主名称" not in exam.columns:
-        # Keep the app usable for older exports, but these rows cannot be recognized as Trafilea-2B.
-        exam["货主名称"] = ""
-
     exam["京东订单号"] = exam["京东订单号"].astype(str).str.strip()
     exam["件数"] = pd.to_numeric(exam["件数"], errors="coerce").fillna(0)
     exam["生产结束时间"] = pd.to_datetime(exam["生产结束时间"], errors="coerce")
@@ -122,30 +84,13 @@ def prepare_exam(exam_raw: pd.DataFrame, params: AnalysisParams) -> pd.DataFrame
     else:
         exam["是否取消订单"] = False
 
-    exam["Trafilea货主"] = exam["货主名称"].map(_trafilea_owner)
-    is_trafilea_2b = exam["Trafilea货主"].ne("")
-    is_normal_2b = exam["SPB名称"].map(_is_normal_2b_spb)
-    is_2b = is_trafilea_2b | is_normal_2b
-
-    # If an order meets both rules, it belongs to Trafilea-2B so it is counted only once.
-    exam["2B子类型"] = np.select(
-        [is_trafilea_2b, is_normal_2b],
-        ["Trafilea-2B", "普通2B"],
-        default="非2B",
-    )
-    exam["2B识别依据"] = np.select(
-        [is_trafilea_2b & is_normal_2b, is_trafilea_2b, is_normal_2b],
-        ["货主名称+SPB名称", "货主名称", "SPB名称"],
-        default="非2B",
-    )
-
+    is_2b = exam["SPB名称"].map(lambda x: _contains_2b(x, params.two_b_keyword))
     is_oversized = (~is_2b) & (exam["件数"] > params.oversized_order_threshold)
     exam["订单类型"] = np.select(
         [is_2b, is_oversized],
         ["2B", "超大异常单"],
         default="2C",
     )
-    exam["订单分析类型"] = np.where(exam["订单类型"].eq("2B"), exam["2B子类型"], exam["订单类型"])
     exam["到期日期"] = exam["生产结束时间"].dt.date
 
     # The assessment export should be one row per order. Keep a single record if duplicates appear.
@@ -157,6 +102,7 @@ def parse_location(location: object, params: AnalysisParams) -> tuple[float, flo
     text = "" if pd.isna(location) else str(location).strip().upper()
     area_match = re.search(r"(?:^|-)A(\d{1,3})(?:-|$)", text)
     if area_match is None:
+        # Most records begin directly with Axx, so also support that format.
         area_match = re.search(r"^A(\d{1,3})(?:-|$)", text)
     level_match = re.search(r"(?:^|-)L(\d+)(?:-|$)", text)
 
@@ -168,7 +114,7 @@ def parse_location(location: object, params: AnalysisParams) -> tuple[float, flo
         and params.high_area_start <= area <= params.high_area_end
         and level >= params.high_level_start
     )
-    # All records not matching the configured high-level range are ground picking.
+    # Per user's rule: all records not matching the high-level range are ground picking.
     pick_level = "高层拣选" if is_high else "地面拣选"
     return area, level, pick_level, parsed
 
@@ -190,6 +136,8 @@ def prepare_pick(pick_raw: pd.DataFrame, exam: pd.DataFrame, params: AnalysisPar
     pick["高层件数"] = np.where(pick["拣选层级"].eq("高层拣选"), pick["实际拣货量"], 0)
     pick["地面件数"] = np.where(pick["拣选层级"].eq("地面拣选"), pick["实际拣货量"], 0)
 
+    # The picking export also contains a production-end column. Preserve it for comparison,
+    # but use the assessment export as the standard demand deadline after the join.
     if "生产结束时间" in pick.columns:
         pick = pick.rename(columns={"生产结束时间": "拣货结果生产结束时间"})
         pick["拣货结果生产结束时间"] = pd.to_datetime(pick["拣货结果生产结束时间"], errors="coerce")
@@ -200,33 +148,23 @@ def prepare_pick(pick_raw: pd.DataFrame, exam: pd.DataFrame, params: AnalysisPar
         "生产结束时间",
         "到期日期",
         "SPB名称",
-        "货主名称",
-        "Trafilea货主",
         "订单类型",
-        "2B子类型",
-        "2B识别依据",
-        "订单分析类型",
         "是否取消订单",
     ]
     lookup = exam[order_lookup_cols].rename(
         columns={
             "京东订单号": "订单号",
             "件数": "订单总件数",
-            # Avoid clashes with the owner-name field that may already exist in the pick export.
-            "货主名称": "考核单货主名称",
         }
     )
     pick = pick.merge(lookup, on="订单号", how="left", validate="many_to_one")
-    pick["订单匹配状态"] = np.where(pick["订单类型"].notna(), "已匹配", "未匹配考核单")
-
+    pick["订单匹配状态"] = np.where(pick["生产结束时间"].notna(), "已匹配", "未匹配考核单")
+    # Future orders may not exist in a single-day assessment file. Their deadline is still
+    # available in the picking result, so use it as a fallback for timing analysis.
     if "拣货结果生产结束时间" in pick.columns:
         pick["生产结束时间"] = pick["生产结束时间"].combine_first(pick["拣货结果生产结束时间"])
     pick["到期日期"] = pd.to_datetime(pick["生产结束时间"], errors="coerce").dt.date
     pick["订单类型"] = pick["订单类型"].fillna("未匹配")
-    pick["2B子类型"] = pick["2B子类型"].fillna("未匹配")
-    pick["2B识别依据"] = pick["2B识别依据"].fillna("未匹配")
-    pick["订单分析类型"] = pick["订单分析类型"].fillna("未匹配")
-    pick["Trafilea货主"] = pick["Trafilea货主"].fillna("")
 
     actual_day = pd.to_datetime(pick["拣货完成时间"]).dt.normalize()
     due_day = pd.to_datetime(pick["生产结束时间"]).dt.normalize()
@@ -271,8 +209,6 @@ def build_task_table(pick_filtered: pd.DataFrame, params: AnalysisParams) -> pd.
             任务件数=("实际拣货量", "sum"),
             订单数=("订单号", "nunique"),
             高层件数=("高层件数", "sum"),
-            Trafilea二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "2B子类型"].eq("Trafilea-2B")].sum()),
-            普通二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "2B子类型"].eq("普通2B")].sum()),
         )
         .reset_index()
     )
@@ -301,8 +237,6 @@ def build_person_productivity(pick_filtered: pd.DataFrame, tasks: pd.DataFrame) 
             高层件数=("高层件数", "sum"),
             地面件数=("地面件数", "sum"),
             二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("2B")].sum()),
-            Trafilea二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "2B子类型"].eq("Trafilea-2B")].sum()),
-            普通二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "2B子类型"].eq("普通2B")].sum()),
             二C件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("2C")].sum()),
             超大异常件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("超大异常单")].sum()),
         )
@@ -310,7 +244,7 @@ def build_person_productivity(pick_filtered: pd.DataFrame, tasks: pd.DataFrame) 
     )
 
     valid_tasks = tasks[tasks["任务时长有效"]].copy()
-    hours_by_person: dict[object, float] = {}
+    hours_by_person = {}
     for person, group in valid_tasks.groupby("人员键"):
         intervals = list(zip(group["任务开始"], group["任务结束"]))
         hours_by_person[person] = merge_intervals(intervals)
@@ -323,12 +257,6 @@ def build_person_productivity(pick_filtered: pd.DataFrame, tasks: pd.DataFrame) 
     )
     people["高层件数占比"] = np.where(people["实际件数"] > 0, people["高层件数"] / people["实际件数"], 0)
     people["2B件数占比"] = np.where(people["实际件数"] > 0, people["二B件数"] / people["实际件数"], 0)
-    people["Trafilea-2B件数占比"] = np.where(
-        people["实际件数"] > 0, people["Trafilea二B件数"] / people["实际件数"], 0
-    )
-    people["普通2B件数占比"] = np.where(
-        people["实际件数"] > 0, people["普通二B件数"] / people["实际件数"], 0
-    )
     people["2C件数占比"] = np.where(people["实际件数"] > 0, people["二C件数"] / people["实际件数"], 0)
     return people.sort_values("件数人效", ascending=False, na_position="last")
 
@@ -371,10 +299,6 @@ def order_level_actual(pick_filtered: pd.DataFrame) -> pd.DataFrame:
         pick_filtered.groupby("订单号", dropna=False)
         .agg(
             订单类型=("订单类型", "first"),
-            二B子类型=("2B子类型", "first"),
-            订单分析类型=("订单分析类型", "first"),
-            二B识别依据=("2B识别依据", "first"),
-            Trafilea货主=("Trafilea货主", "first"),
             SPB名称=("SPB名称", "first"),
             生产结束时间=("生产结束时间", "first"),
             实际完成时间=("拣货完成时间", "max"),
@@ -384,7 +308,6 @@ def order_level_actual(pick_filtered: pd.DataFrame) -> pd.DataFrame:
             任务数=("任务单号", "nunique"),
         )
         .reset_index()
-        .rename(columns={"二B子类型": "2B子类型", "二B识别依据": "2B识别依据"})
     )
     orders["高层件数占比"] = np.where(orders["实际件数"] > 0, orders["高层件数"] / orders["实际件数"], 0)
     orders["订单储位结构"] = np.select(
