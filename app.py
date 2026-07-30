@@ -48,8 +48,9 @@ with st.sidebar:
     )
 
     st.header("分析规则")
-    two_b_keyword = "2B"
-    st.caption("2B固定识别规则：SPB名称中包含‘2B’字样（不区分大小写）。")
+    st.caption(
+        "2B固定识别规则：Trafilea-2B按货主名称识别；普通2B按两种指定SPB名称识别。两类合计为2B。"
+    )
     oversized_threshold = st.number_input("非2B超大异常单阈值（件/订单）", min_value=1, value=500, step=50)
     high_area_start = st.number_input("高层区域起始 A", min_value=0, value=1, step=1)
     high_area_end = st.number_input("高层区域结束 A", min_value=0, value=36, step=1)
@@ -61,7 +62,6 @@ with st.sidebar:
     )
 
 params = AnalysisParams(
-    two_b_keyword=two_b_keyword,
     oversized_order_threshold=int(oversized_threshold),
     high_area_start=int(high_area_start),
     high_area_end=int(high_area_end),
@@ -115,23 +115,27 @@ with filter_col2:
 with filter_col3:
     order_filter_label = st.selectbox(
         "订单类型筛选",
-        ["全部订单", "仅2B", "仅2C", "仅超大异常单"],
+        ["全部订单", "全部2B", "仅Trafilea-2B", "仅普通2B", "仅2C", "仅超大异常单"],
         index=0,
     )
 
-order_filter_map = {
-    "全部订单": None,
-    "仅2B": "2B",
-    "仅2C": "2C",
-    "仅超大异常单": "超大异常单",
-}
-selected_order_type = order_filter_map[order_filter_label]
-
 exam_scope = exam.copy()
 pick_scope = pick.copy()
-if selected_order_type is not None:
-    exam_scope = exam_scope[exam_scope["订单类型"].eq(selected_order_type)].copy()
-    pick_scope = pick_scope[pick_scope["订单类型"].eq(selected_order_type)].copy()
+if order_filter_label == "全部2B":
+    exam_scope = exam_scope[exam_scope["订单类型"].eq("2B")].copy()
+    pick_scope = pick_scope[pick_scope["订单类型"].eq("2B")].copy()
+elif order_filter_label == "仅Trafilea-2B":
+    exam_scope = exam_scope[exam_scope["2B子类型"].eq("Trafilea-2B")].copy()
+    pick_scope = pick_scope[pick_scope["2B子类型"].eq("Trafilea-2B")].copy()
+elif order_filter_label == "仅普通2B":
+    exam_scope = exam_scope[exam_scope["2B子类型"].eq("普通2B")].copy()
+    pick_scope = pick_scope[pick_scope["2B子类型"].eq("普通2B")].copy()
+elif order_filter_label == "仅2C":
+    exam_scope = exam_scope[exam_scope["订单类型"].eq("2C")].copy()
+    pick_scope = pick_scope[pick_scope["订单类型"].eq("2C")].copy()
+elif order_filter_label == "仅超大异常单":
+    exam_scope = exam_scope[exam_scope["订单类型"].eq("超大异常单")].copy()
+    pick_scope = pick_scope[pick_scope["订单类型"].eq("超大异常单")].copy()
 
 pick_day = pick_scope[pick_scope["实际完成日期"].eq(analysis_date)].copy()
 orders_day = order_level_actual(pick_day)
@@ -140,7 +144,8 @@ people_day = build_person_productivity(pick_day, tasks_day)
 demand = demand_summary(exam_scope, demand_date)
 
 st.caption(
-    f"当前分析范围：{order_filter_label}。2B判定为SPB名称中包含‘2B’字样（不区分大小写）。"
+    f"当前分析范围：{order_filter_label}。Trafilea-2B：货主名称为 Walmart、Belk、Kohl’s 或 Nordstrom；"
+    "普通2B：SPB名称为 WW-2B Self Pick Up 或 WW-Pick-First Transport。"
 )
 
 if pick_day.empty:
@@ -172,7 +177,15 @@ k2.metric("实际订单数", f"{actual_orders:,}")
 k3.metric("操作人数", f"{operators:,}")
 k4.metric("有效操作工时", f"{valid_active_hours:,.1f}")
 k5.metric("操作人效", f"{operation_uph:,.1f} 件/时")
-k6.metric("高层 / 2B件数占比", f"{high_share:.1%} / {b2_share:.1%}")
+k6.metric("高层 / 2B总件数占比", f"{high_share:.1%} / {b2_share:.1%}")
+
+trafilea_b2_units = float(pick_day.loc[pick_day["2B子类型"].eq("Trafilea-2B"), "实际拣货量"].sum())
+normal_b2_units = float(pick_day.loc[pick_day["2B子类型"].eq("普通2B"), "实际拣货量"].sum())
+if order_filter_label in {"全部订单", "全部2B", "仅Trafilea-2B", "仅普通2B"}:
+    b21, b22, b23 = st.columns(3)
+    b21.metric("2B总件数", f"{b2_units:,.0f}")
+    b22.metric("Trafilea-2B件数", f"{trafilea_b2_units:,.0f}")
+    b23.metric("普通2B件数", f"{normal_b2_units:,.0f}")
 
 if operators:
     st.caption("注意：目前显示的是系统任务时间口径的‘操作人效’，不是包含等待、培训和辅助工作的完整出勤人效。")
@@ -222,10 +235,10 @@ with tab_overview:
         st.plotly_chart(fig, use_container_width=True)
 
 with tab_structure:
-    st.subheader("2B / 2C 与高层 / 地面交叉结构")
+    st.subheader("Trafilea-2B / 普通2B / 2C 与高层 / 地面交叉结构")
     cross = pd.pivot_table(
         pick_day,
-        index="订单类型",
+        index="订单分析类型",
         columns="拣选层级",
         values="实际拣货量",
         aggfunc="sum",
@@ -236,11 +249,11 @@ with tab_structure:
     st.dataframe(cross, use_container_width=True)
 
     chart_data = (
-        pick_day.groupby(["订单类型", "拣选层级"], dropna=False)["实际拣货量"]
+        pick_day.groupby(["订单分析类型", "拣选层级"], dropna=False)["实际拣货量"]
         .sum()
         .reset_index(name="件数")
     )
-    fig = px.bar(chart_data, x="订单类型", y="件数", color="拣选层级", barmode="stack", text_auto=",.0f")
+    fig = px.bar(chart_data, x="订单分析类型", y="件数", color="拣选层级", barmode="stack", text_auto=",.0f")
     fig.update_layout(xaxis_title="", yaxis_title="实际拣货件数", legend_title="")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -256,12 +269,30 @@ with tab_structure:
     with right:
         st.markdown("#### 订单类型结构")
         order_type = (
-            orders_day.groupby("订单类型", dropna=False)
+            orders_day.groupby("订单分析类型", dropna=False)
             .agg(订单数=("订单号", "nunique"), 件数=("实际件数", "sum"))
             .reset_index()
         )
         order_type["件数占比"] = order_type["件数"] / order_type["件数"].sum() if order_type["件数"].sum() else 0
         st.dataframe(order_type, use_container_width=True, hide_index=True, column_config={"件数占比": st.column_config.NumberColumn(format="percent")})
+
+    st.markdown("#### 2B子类型明细")
+    b2_structure = (
+        orders_day[orders_day["订单类型"].eq("2B")]
+        .groupby(["2B子类型", "2B识别依据", "Trafilea货主"], dropna=False)
+        .agg(订单数=("订单号", "nunique"), 件数=("实际件数", "sum"))
+        .reset_index()
+    )
+    if b2_structure.empty:
+        st.info("当前筛选范围内没有已识别的2B订单。")
+    else:
+        b2_structure["件数占2B比例"] = b2_structure["件数"] / b2_structure["件数"].sum()
+        st.dataframe(
+            b2_structure,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"件数占2B比例": st.column_config.NumberColumn(format="percent")},
+        )
 
     st.markdown("#### 高层占比对员工操作人效的影响（当天横截面）")
     scatter_data = people_day.dropna(subset=["件数人效"]).copy()
@@ -285,7 +316,9 @@ with tab_people:
     st.caption("有效操作工时会先按任务单计算开始与结束时间，再合并同一员工的重叠区间；超过左侧任务时长阈值的任务不计入工时。")
     display_cols = [
         "工号", "姓名", "实际件数", "订单数", "任务数", "有效操作工时", "件数人效",
-        "高层件数", "高层件数占比", "二B件数", "2B件数占比", "二C件数", "2C件数占比", "超大异常件数",
+        "高层件数", "高层件数占比", "二B件数", "2B件数占比",
+        "Trafilea二B件数", "Trafilea-2B件数占比", "普通二B件数", "普通2B件数占比",
+        "二C件数", "2C件数占比", "超大异常件数",
     ]
     st.dataframe(
         people_day[display_cols],
@@ -296,6 +329,8 @@ with tab_people:
             "件数人效": st.column_config.NumberColumn(format="%.1f"),
             "高层件数占比": st.column_config.NumberColumn(format="percent"),
             "2B件数占比": st.column_config.NumberColumn(format="percent"),
+            "Trafilea-2B件数占比": st.column_config.NumberColumn(format="percent"),
+            "普通2B件数占比": st.column_config.NumberColumn(format="percent"),
             "2C件数占比": st.column_config.NumberColumn(format="percent"),
         },
     )
@@ -321,7 +356,7 @@ with tab_exceptions:
 
     if not oversized.empty:
         st.markdown("#### 非2B但超过阈值的超大异常单")
-        st.dataframe(oversized[["京东订单号", "件数", "SPB名称", "生产结束时间", "货主名称"] if "货主名称" in oversized.columns else ["京东订单号", "件数", "SPB名称", "生产结束时间"]], use_container_width=True, hide_index=True)
+        st.dataframe(oversized[["京东订单号", "件数", "订单类型", "2B子类型", "SPB名称", "生产结束时间", "货主名称"] if "货主名称" in oversized.columns else ["京东订单号", "件数", "SPB名称", "生产结束时间"]], use_container_width=True, hide_index=True)
     if not unmatched.empty:
         st.markdown("#### 拣货结果未匹配到考核单")
         st.dataframe(unmatched[["订单号", "实际拣货量", "拣货完成时间", "姓名"]].drop_duplicates(), use_container_width=True, hide_index=True)
