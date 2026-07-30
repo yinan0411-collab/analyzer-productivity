@@ -1,346 +1,327 @@
 from __future__ import annotations
 
-from io import BytesIO
+from datetime import date
 from pathlib import Path
-import re
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
-from attendance_analyzer import (
-    Thresholds,
-    analyze_attendance,
-    build_summary,
-    prepare_data,
-    validate_columns,
+from analysis_engine import (
+    AnalysisParams,
+    build_person_productivity,
+    build_task_table,
+    demand_summary,
+    order_level_actual,
+    prepare_exam,
+    prepare_pick,
+    read_excel,
 )
 
+st.set_page_config(page_title="LAX2 出库产能分析", page_icon="📦", layout="wide")
 
-st.set_page_config(
-    page_title="员工班次偏差检查",
-    page_icon="⏱️",
-    layout="wide",
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
+    [data-testid="stMetricValue"] {font-size: 1.65rem;}
+    .small-note {color:#5f6368; font-size:0.9rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.title("员工排班与实际打卡偏差检查")
-st.caption(
-    "上传考勤导出表，按日期和考勤组识别迟到、早退、提前上班、晚下班、缺卡、休息日打卡等需复核记录。"
-)
-
-with st.expander("判断口径说明", expanded=False):
-    st.markdown(
-        """
-        - 程序不直接采用原表中的“异常状态”，而是重新比较计划时间和实际打卡时间。
-        - 结果表示“需要复核的记录”，不等同于已经认定员工违规。
-        - 只有超过阈值的记录才会显示；刚好等于阈值不会被标记。
-        - 休息日有打卡、整班无打卡、有打卡无排班可单独开启或关闭。
-        """
-    )
-
-uploaded_files = st.file_uploader(
-    "上传考勤表（支持同时上传多个 Excel 文件）",
-    type=["xlsx", "xls"],
-    accept_multiple_files=True,
-)
+st.title("📦 LAX2 出库产能与订单结构分析（初版）")
+st.caption("当前先跑通：考核单 → 拣货结果 → 2B/2C与高低层结构 → 实际操作人效。出勤人数、排班工时和其他出库环节将在下一版接入。")
 
 with st.sidebar:
-    st.header("分析设置")
-
-    use_same_threshold = st.toggle("四类偏差使用同一阈值", value=True)
-    if use_same_threshold:
-        common_threshold = st.number_input(
-            "统一阈值（分钟）",
-            min_value=0,
-            max_value=720,
-            value=30,
-            step=5,
-        )
-        thresholds = Thresholds(
-            early_start=int(common_threshold),
-            late_start=int(common_threshold),
-            early_leave=int(common_threshold),
-            late_leave=int(common_threshold),
-        )
-    else:
-        thresholds = Thresholds(
-            early_start=int(st.number_input(
-                "允许提前上班（分钟）", 0, 720, 30, 5
-            )),
-            late_start=int(st.number_input(
-                "允许迟到（分钟）", 0, 720, 30, 5
-            )),
-            early_leave=int(st.number_input(
-                "允许提前下班（分钟）", 0, 720, 30, 5
-            )),
-            late_leave=int(st.number_input(
-                "允许晚下班（分钟）", 0, 720, 30, 5
-            )),
-        )
-
-    st.divider()
-    flag_missing = st.checkbox("标记缺卡/整班无打卡", value=True)
-    flag_rest = st.checkbox("标记休息日打卡", value=True)
-    flag_no_schedule = st.checkbox("标记有打卡无排班", value=True)
-    deduplicate = st.checkbox(
-        "合并文件后自动去重",
-        value=True,
-        help="按用户编码 + 日期 + 考勤组保留最新记录。",
+    st.header("上传数据")
+    exam_files = st.file_uploader(
+        "① 实际需要生产的单（考核单，可一次多选一周文件）",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+    )
+    pick_files = st.file_uploader(
+        "② 拣货实际完成结果（可一次多选一周文件）",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
     )
 
+    st.header("分析规则")
+    two_b_keyword = st.text_input("2B识别关键词", value="2B")
+    oversized_threshold = st.number_input("非2B超大异常单阈值（件/订单）", min_value=1, value=500, step=50)
+    high_area_start = st.number_input("高层区域起始 A", min_value=0, value=1, step=1)
+    high_area_end = st.number_input("高层区域结束 A", min_value=0, value=36, step=1)
+    high_level_start = st.number_input("高层起始层级 L", min_value=1, value=3, step=1)
+    max_task_minutes = st.number_input("有效任务最长时长（分钟）", min_value=5, value=240, step=15)
 
-def read_uploaded_files(files) -> pd.DataFrame:
-    frames = []
-    for uploaded in files:
-        uploaded.seek(0)
-        try:
-            frame = pd.read_excel(uploaded, sheet_name=0)
-        except Exception as exc:
-            st.error(f"无法读取 {uploaded.name}：{exc}")
-            continue
-        frame["来源文件"] = uploaded.name
-        frames.append(frame)
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(frames, ignore_index=True, sort=False)
-
-
-def safe_sheet_name(value: object, used_names: set[str]) -> str:
-    base = str(value) if value is not None else "未知日期"
-    base = re.sub(r'[\[\]:*?/\\]', "-", base)[:31] or "明细"
-    candidate = base
-    index = 2
-    while candidate in used_names:
-        suffix = f"-{index}"
-        candidate = f"{base[:31-len(suffix)]}{suffix}"
-        index += 1
-    used_names.add(candidate)
-    return candidate
-
-
-def format_workbook(writer: pd.ExcelWriter) -> None:
-    workbook = writer.book
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    header_alignment = Alignment(horizontal="center", vertical="center")
-
-    for sheet in workbook.worksheets:
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-
-        for cell in sheet[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-
-        for column_cells in sheet.columns:
-            letter = get_column_letter(column_cells[0].column)
-            max_length = 0
-            for cell in column_cells[:3000]:
-                value = "" if cell.value is None else str(cell.value)
-                max_length = max(max_length, len(value))
-            sheet.column_dimensions[letter].width = min(max(max_length + 2, 10), 40)
-
-        for row in sheet.iter_rows(min_row=2):
-            for cell in row:
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-        header_map = {cell.value: cell.column for cell in sheet[1]}
-        for name in [
-            "计划上班时间", "实际上班时间",
-            "计划下班时间", "实际下班时间",
-        ]:
-            if name in header_map:
-                col_idx = header_map[name]
-                for cell in sheet.iter_cols(
-                    min_col=col_idx, max_col=col_idx, min_row=2
-                ):
-                    for item in cell:
-                        item.number_format = "yyyy-mm-dd hh:mm"
-
-
-def make_excel(result: pd.DataFrame, summary: pd.DataFrame) -> bytes:
-    output = BytesIO()
-    used_names: set[str] = set()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, index=False, sheet_name="异常汇总")
-        used_names.add("异常汇总")
-
-        for date_value in sorted(result["日期"].dropna().unique()):
-            daily = result[result["日期"] == date_value].copy()
-            sheet_name = safe_sheet_name(date_value, used_names)
-            daily.to_excel(writer, index=False, sheet_name=sheet_name)
-
-        if result["日期"].isna().any():
-            unknown = result[result["日期"].isna()].copy()
-            unknown.to_excel(
-                writer,
-                index=False,
-                sheet_name=safe_sheet_name("未知日期", used_names),
-            )
-
-        format_workbook(writer)
-
-    output.seek(0)
-    return output.getvalue()
-
-
-if not uploaded_files:
-    st.info("请先上传考勤导出表。")
-    st.stop()
-
-raw_data = read_uploaded_files(uploaded_files)
-if raw_data.empty:
-    st.stop()
-
-prepared = prepare_data(raw_data, deduplicate=deduplicate)
-missing_columns = validate_columns(prepared)
-if missing_columns:
-    st.error(
-        "文件缺少必要字段："
-        + "、".join(missing_columns)
-        + "。请确认上传的是考勤明细导出表。"
+    st.info(
+        f"高层默认规则：A{int(high_area_start):02d}–A{int(high_area_end):02d} 且 L{int(high_level_start)}及以上。其余全部计为地面拣选。"
     )
-    st.write("当前识别到的列：", list(prepared.columns))
-    st.stop()
 
-result = analyze_attendance(
-    prepared,
-    thresholds=thresholds,
-    flag_missing_punches=flag_missing,
-    flag_rest_day_punches=flag_rest,
-    flag_punch_without_schedule=flag_no_schedule,
+params = AnalysisParams(
+    two_b_keyword=two_b_keyword,
+    oversized_order_threshold=int(oversized_threshold),
+    high_area_start=int(high_area_start),
+    high_area_end=int(high_area_end),
+    high_level_start=int(high_level_start),
+    max_valid_task_minutes=int(max_task_minutes),
 )
 
-if result.empty:
-    st.success("按照当前阈值和规则，没有发现需要复核的员工记录。")
+if not exam_files or not pick_files:
+    st.subheader("这一版可以回答什么？")
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("**当天需求**\n\n到期订单/件数、开班前已完成、开班时剩余、是否超过生产结束时间。")
+    c2.markdown("**订单难度结构**\n\n2B、2C、超大异常单，以及高层/地面件数的交叉占比。")
+    c3.markdown("**拣货操作人效**\n\n按员工合并重叠任务时间，计算件数、人效、高层占比和2B占比。")
+    st.warning("请在左侧上传两张Excel表。")
     st.stop()
 
-all_groups = sorted(
-    group for group in result["考勤组"].dropna().astype(str).unique()
-)
-all_dates = sorted(date for date in result["日期"].dropna().unique())
+@st.cache_data(show_spinner=False)
+def load_and_prepare(exam_payloads: tuple[bytes, ...], pick_payloads: tuple[bytes, ...], params_dict: dict):
+    import io
 
-with st.sidebar:
-    st.divider()
-    st.header("结果筛选")
-    selected_groups = st.multiselect(
-        "考勤组",
-        options=all_groups,
-        default=all_groups,
-    )
+    p = AnalysisParams(**params_dict)
+    exam_raw = pd.concat([read_excel(io.BytesIO(data)) for data in exam_payloads], ignore_index=True)
+    pick_raw = pd.concat([read_excel(io.BytesIO(data)) for data in pick_payloads], ignore_index=True)
+    exam = prepare_exam(exam_raw, p)
+    pick = prepare_pick(pick_raw, exam, p)
+    return exam, pick
 
-    if all_dates:
-        selected_date_range = st.date_input(
-            "日期范围",
-            value=(all_dates[0], all_dates[-1]),
-            min_value=all_dates[0],
-            max_value=all_dates[-1],
+with st.spinner("正在读取并关联订单与拣货数据……"):
+    try:
+        exam, pick = load_and_prepare(
+            tuple(file.getvalue() for file in exam_files),
+            tuple(file.getvalue() for file in pick_files),
+            params.__dict__,
         )
-    else:
-        selected_date_range = None
+    except Exception as exc:
+        st.error(f"数据读取失败：{exc}")
+        st.stop()
 
-filtered = result[result["考勤组"].isin(selected_groups)].copy()
+actual_dates = sorted(d for d in pick["实际完成日期"].dropna().unique())
+due_dates = sorted(d for d in exam["到期日期"].dropna().unique())
+if not actual_dates:
+    st.error("拣货结果中没有可识别的‘拣货完成时间’。")
+    st.stop()
 
-if selected_date_range:
-    if isinstance(selected_date_range, tuple) and len(selected_date_range) == 2:
-        start_date, end_date = selected_date_range
+filter_col1, filter_col2 = st.columns(2)
+with filter_col1:
+    analysis_date = st.selectbox("实际拣货分析日期", actual_dates, index=len(actual_dates) - 1, format_func=lambda x: str(x))
+with filter_col2:
+    default_due_index = due_dates.index(analysis_date) if analysis_date in due_dates else len(due_dates) - 1
+    demand_date = st.selectbox("应生产需求日期", due_dates, index=max(default_due_index, 0), format_func=lambda x: str(x))
+
+pick_day = pick[pick["实际完成日期"].eq(analysis_date)].copy()
+orders_day = order_level_actual(pick_day)
+tasks_day = build_task_table(pick_day, params)
+people_day = build_person_productivity(pick_day, tasks_day)
+demand = demand_summary(exam, demand_date)
+
+actual_units = float(pick_day["实际拣货量"].sum())
+actual_orders = int(pick_day["订单号"].nunique())
+actual_tasks = int(pick_day["任务单号"].nunique())
+operators = int(pick_day["人员键"].nunique())
+valid_active_hours = float(people_day["有效操作工时"].sum()) if not people_day.empty else 0
+operation_uph = actual_units / valid_active_hours if valid_active_hours > 0 else 0
+high_units = float(pick_day["高层件数"].sum())
+high_share = high_units / actual_units if actual_units else 0
+b2_units = float(pick_day.loc[pick_day["订单类型"].eq("2B"), "实际拣货量"].sum())
+b2_share = b2_units / actual_units if actual_units else 0
+
+st.divider()
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric("实际拣货件数", f"{actual_units:,.0f}")
+k2.metric("实际订单数", f"{actual_orders:,}")
+k3.metric("操作人数", f"{operators:,}")
+k4.metric("有效操作工时", f"{valid_active_hours:,.1f}")
+k5.metric("操作人效", f"{operation_uph:,.1f} 件/时")
+k6.metric("高层 / 2B件数占比", f"{high_share:.1%} / {b2_share:.1%}")
+
+if operators:
+    st.caption("注意：目前显示的是系统任务时间口径的‘操作人效’，不是包含等待、培训和辅助工作的完整出勤人效。")
+
+tab_overview, tab_structure, tab_people, tab_exceptions, tab_export = st.tabs(
+    ["当日概览", "订单与储位结构", "员工操作人效", "异常与数据质量", "导出结果"]
+)
+
+with tab_overview:
+    st.subheader(f"{demand_date} 应生产需求")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("到期订单", f"{demand['到期订单数']:,.0f}")
+    d2.metric("到期件数", f"{demand['到期件数']:,.0f}")
+    d3.metric("开班前已拣", f"{demand['开班前已拣件数']:,.0f}")
+    d4.metric("开班时剩余", f"{demand['开班时剩余件数']:,.0f}")
+    d5.metric("超过生产结束时间/未完成", f"{demand['超过生产结束时间件数']:,.0f}")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 当天实际在做哪一天的订单")
+        timing = (
+            pick_day.groupby("生产日期关系", dropna=False)["实际拣货量"]
+            .sum()
+            .reset_index(name="件数")
+            .sort_values("件数", ascending=False)
+        )
+        fig = px.bar(timing, x="生产日期关系", y="件数", text_auto=",.0f")
+        fig.update_layout(xaxis_title="", yaxis_title="实际拣货件数", showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        timing["件数占比"] = timing["件数"] / timing["件数"].sum() if timing["件数"].sum() else 0
+        st.dataframe(timing, use_container_width=True, hide_index=True, column_config={"件数占比": st.column_config.NumberColumn(format="percent")})
+
+    with right:
+        st.markdown("#### 到期需求完成结构")
+        due_status = pd.DataFrame(
+            {
+                "状态": ["开班前已完成", "当日仍需处理", "超过生产结束时间/未完成"],
+                "件数": [
+                    demand["开班前已拣件数"],
+                    demand["开班时剩余件数"],
+                    demand["超过生产结束时间件数"],
+                ],
+            }
+        )
+        fig = px.bar(due_status, x="状态", y="件数", text_auto=",.0f")
+        fig.update_layout(xaxis_title="", yaxis_title="件数", showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab_structure:
+    st.subheader("2B / 2C 与高层 / 地面交叉结构")
+    cross = pd.pivot_table(
+        pick_day,
+        index="订单类型",
+        columns="拣选层级",
+        values="实际拣货量",
+        aggfunc="sum",
+        fill_value=0,
+        margins=True,
+        margins_name="合计",
+    )
+    st.dataframe(cross, use_container_width=True)
+
+    chart_data = (
+        pick_day.groupby(["订单类型", "拣选层级"], dropna=False)["实际拣货量"]
+        .sum()
+        .reset_index(name="件数")
+    )
+    fig = px.bar(chart_data, x="订单类型", y="件数", color="拣选层级", barmode="stack", text_auto=",.0f")
+    fig.update_layout(xaxis_title="", yaxis_title="实际拣货件数", legend_title="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 订单储位结构")
+        order_loc = (
+            orders_day.groupby("订单储位结构", dropna=False)
+            .agg(订单数=("订单号", "nunique"), 件数=("实际件数", "sum"))
+            .reset_index()
+        )
+        st.dataframe(order_loc, use_container_width=True, hide_index=True)
+    with right:
+        st.markdown("#### 订单类型结构")
+        order_type = (
+            orders_day.groupby("订单类型", dropna=False)
+            .agg(订单数=("订单号", "nunique"), 件数=("实际件数", "sum"))
+            .reset_index()
+        )
+        order_type["件数占比"] = order_type["件数"] / order_type["件数"].sum() if order_type["件数"].sum() else 0
+        st.dataframe(order_type, use_container_width=True, hide_index=True, column_config={"件数占比": st.column_config.NumberColumn(format="percent")})
+
+    st.markdown("#### 高层占比对员工操作人效的影响（当天横截面）")
+    scatter_data = people_day.dropna(subset=["件数人效"]).copy()
+    if len(scatter_data) >= 2:
+        fig = px.scatter(
+            scatter_data,
+            x="高层件数占比",
+            y="件数人效",
+            size="实际件数",
+            color="2B件数占比",
+            hover_name="姓名",
+            hover_data=["工号", "实际件数", "有效操作工时", "订单数"],
+        )
+        fig.update_layout(xaxis_tickformat=".0%", coloraxis_colorbar_title="2B占比", xaxis_title="高层件数占比", yaxis_title="件数/有效操作小时")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        start_date = end_date = selected_date_range
-    filtered = filtered[
-        filtered["日期"].between(start_date, end_date, inclusive="both")
+        st.info("当前日期有效人员数据不足，暂时不能绘制关系图。")
+
+with tab_people:
+    st.subheader("员工实际操作产出")
+    st.caption("有效操作工时会先按任务单计算开始与结束时间，再合并同一员工的重叠区间；超过左侧任务时长阈值的任务不计入工时。")
+    display_cols = [
+        "工号", "姓名", "实际件数", "订单数", "任务数", "有效操作工时", "件数人效",
+        "高层件数", "高层件数占比", "二B件数", "2B件数占比", "二C件数", "2C件数占比", "超大异常件数",
     ]
-
-summary = build_summary(filtered)
-
-metric1, metric2, metric3, metric4 = st.columns(4)
-metric1.metric("异常人次", f"{len(filtered):,}")
-metric2.metric("异常员工数", f"{filtered['用户编码'].nunique():,}")
-metric3.metric("涉及日期", f"{filtered['日期'].nunique():,}")
-metric4.metric("涉及考勤组", f"{filtered['考勤组'].nunique():,}")
-
-tab_daily, tab_summary = st.tabs(["按日期查看", "异常汇总"])
-
-with tab_daily:
-    available_dates = sorted(filtered["日期"].dropna().unique())
-    if not available_dates:
-        st.warning("当前筛选条件下没有记录。")
-    else:
-        selected_date = st.selectbox(
-            "选择日期",
-            options=available_dates,
-            format_func=lambda value: str(value),
-        )
-        daily_data = filtered[filtered["日期"] == selected_date]
-
-        for group_name, group_data in daily_data.groupby("考勤组", dropna=False):
-            title = f"{group_name or '未填写考勤组'}（{len(group_data)} 人次）"
-            with st.expander(title, expanded=True):
-                st.dataframe(
-                    group_data,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "上班偏差(分钟)": st.column_config.NumberColumn(
-                            format="%.1f"
-                        ),
-                        "下班偏差(分钟)": st.column_config.NumberColumn(
-                            format="%.1f"
-                        ),
-                    },
-                )
-
-with tab_summary:
-    st.subheader("按日期、考勤组汇总")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    if not summary.empty:
-        date_chart = (
-            summary.groupby("日期", as_index=False)["异常人次"]
-            .sum()
-            .set_index("日期")
-        )
-        st.subheader("每日异常人次")
-        st.bar_chart(date_chart)
-
-        group_chart = (
-            summary.groupby("考勤组", as_index=False)["异常人次"]
-            .sum()
-            .sort_values("异常人次", ascending=False)
-            .set_index("考勤组")
-        )
-        st.subheader("各考勤组异常人次")
-        st.bar_chart(group_chart)
-
-download_col1, download_col2 = st.columns(2)
-
-with download_col1:
-    excel_bytes = make_excel(filtered, summary)
-    st.download_button(
-        "下载异常 Excel（按日期分工作表）",
-        data=excel_bytes,
-        file_name="员工班次偏差异常明细.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+    st.dataframe(
+        people_day[display_cols],
         use_container_width=True,
+        hide_index=True,
+        column_config={
+            "有效操作工时": st.column_config.NumberColumn(format="%.2f"),
+            "件数人效": st.column_config.NumberColumn(format="%.1f"),
+            "高层件数占比": st.column_config.NumberColumn(format="percent"),
+            "2B件数占比": st.column_config.NumberColumn(format="percent"),
+            "2C件数占比": st.column_config.NumberColumn(format="percent"),
+        },
     )
 
-with download_col2:
-    csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
+    top_n = st.slider("图表显示人数", min_value=5, max_value=max(5, min(50, len(people_day))), value=min(15, max(5, len(people_day)))) if len(people_day) else 5
+    chart_people = people_day.head(top_n).sort_values("件数人效")
+    if not chart_people.empty:
+        fig = px.bar(chart_people, x="件数人效", y="姓名", orientation="h", hover_data=["实际件数", "有效操作工时", "高层件数占比", "2B件数占比"])
+        fig.update_layout(xaxis_title="件数/有效操作小时", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab_exceptions:
+    st.subheader("需要人工确认的异常")
+    e1, e2, e3, e4 = st.columns(4)
+    oversized = exam[(~exam["是否取消订单"]) & exam["订单类型"].eq("超大异常单")]
+    unmatched = pick_day[pick_day["订单匹配状态"].eq("未匹配考核单")]
+    unparsed = pick_day[~pick_day["储位可解析"]]
+    abnormal_tasks = tasks_day[~tasks_day["任务时长有效"]]
+    e1.metric("非2B超大异常订单", f"{oversized['京东订单号'].nunique():,}")
+    e2.metric("未匹配考核单的拣货订单", f"{unmatched['订单号'].nunique():,}")
+    e3.metric("无法解析储位明细", f"{len(unparsed):,}")
+    e4.metric("异常任务时长", f"{len(abnormal_tasks):,}")
+
+    if not oversized.empty:
+        st.markdown("#### 非2B但超过阈值的超大异常单")
+        st.dataframe(oversized[["京东订单号", "件数", "SPB名称", "生产结束时间", "货主名称"] if "货主名称" in oversized.columns else ["京东订单号", "件数", "SPB名称", "生产结束时间"]], use_container_width=True, hide_index=True)
+    if not unmatched.empty:
+        st.markdown("#### 拣货结果未匹配到考核单")
+        st.dataframe(unmatched[["订单号", "实际拣货量", "拣货完成时间", "姓名"]].drop_duplicates(), use_container_width=True, hide_index=True)
+    if not unparsed.empty:
+        st.markdown("#### 无法解析储位（仍按地面拣选计入）")
+        st.dataframe(unparsed[["订单号", "储位", "实际拣货量", "姓名"]].drop_duplicates().head(500), use_container_width=True, hide_index=True)
+    if not abnormal_tasks.empty:
+        st.markdown("#### 异常任务时长")
+        st.dataframe(abnormal_tasks[["工号", "姓名", "任务单号", "任务开始", "任务结束", "任务分钟", "异常原因"]], use_container_width=True, hide_index=True)
+
+with tab_export:
+    st.subheader("下载分析结果")
     st.download_button(
-        "下载全部异常 CSV",
-        data=csv_bytes,
-        file_name="员工班次偏差异常明细.csv",
+        "下载员工人效 CSV",
+        people_day.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=f"拣货员工人效_{analysis_date}.csv",
         mime="text/csv",
-        use_container_width=True,
+    )
+    st.download_button(
+        "下载订单级分析 CSV",
+        orders_day.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=f"拣货订单分析_{analysis_date}.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "下载任务级分析 CSV",
+        tasks_day.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=f"拣货任务分析_{analysis_date}.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "下载明细关联结果 CSV",
+        pick_day.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=f"拣货关联明细_{analysis_date}.csv",
+        mime="text/csv",
     )
 
-st.caption(
-    "建议先用 30–60 分钟阈值识别明显班次错位，再结合请假、临时调班、批准加班记录进行人工确认。"
-)
+st.divider()
+st.caption("下一步：加入人员名单与实际出勤工时后，可同时计算操作人效与排班人效；再接入复核、Babylist/Mix/2B打包、机区拣货、退供、道口和5S。")

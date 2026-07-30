@@ -1,261 +1,325 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable
+
+import numpy as np
 import pandas as pd
 
 
 @dataclass(frozen=True)
-class Thresholds:
-    early_start: int = 30
-    late_start: int = 30
-    early_leave: int = 30
-    late_leave: int = 30
+class AnalysisParams:
+    two_b_keyword: str = "2B"
+    oversized_order_threshold: int = 500
+    high_area_start: int = 1
+    high_area_end: int = 36
+    high_level_start: int = 3
+    max_valid_task_minutes: int = 240
 
 
-COLUMN_ALIASES = {
-    "姓名": ["姓名", "员工姓名"],
-    "用户编码": ["用户编码", "员工编码", "账号", "User ID"],
-    "日期": ["日期", "考勤日期"],
-    "考勤组": ["考勤组", "考情组", "考勤组名称"],
-    "班休": ["班休", "是否上班"],
-    "班次名称": ["班次名称", "排班班次"],
-    "计划上班时间": ["计划上班时间", "排班上班时间"],
-    "实际上班时间": ["实际上班时间", "实际签到时间", "上班打卡时间"],
-    "计划下班时间": ["计划下班时间", "排班下班时间"],
-    "实际下班时间": ["实际下班时间", "实际签退时间", "下班打卡时间"],
-    "排班时长(时)": ["排班时长(时)", "排班时长"],
-    "打卡时长(时)": ["打卡时长(时)", "打卡时长"],
-    "核算工时(时)": ["核算工时(时)", "核算工时"],
-    "一级供应商": ["一级供应商", "供应商", "劳务公司"],
-    "部门": ["部门"],
-    "岗位": ["岗位"],
-    "异常状态": ["异常状态"],
-    "修改时间": ["修改时间"],
-}
+EXAM_REQUIRED = [
+    "京东订单号",
+    "件数",
+    "生产结束时间",
+    "SPB名称",
+]
+
+PICK_REQUIRED = [
+    "订单号",
+    "任务单号",
+    "储位",
+    "实际拣货量",
+    "任务领取时间",
+    "拣货完成时间",
+    "工号",
+    "姓名",
+]
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """清理列名，并把常见别名统一为系统使用的标准列名。"""
-    result = df.copy()
-    result.columns = [
-        str(c).replace("\n", "").replace("\r", "").strip()
-        for c in result.columns
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def require_columns(df: pd.DataFrame, required: Iterable[str], label: str) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label}缺少字段：{', '.join(missing)}")
+
+
+def read_excel(source) -> pd.DataFrame:
+    """Read the first worksheet from a file path or Streamlit UploadedFile."""
+    return normalize_columns(pd.read_excel(source, sheet_name=0, engine="openpyxl"))
+
+
+def _contains_2b(value: object, keyword: str) -> bool:
+    text = "" if pd.isna(value) else str(value)
+    return keyword.casefold() in text.casefold()
+
+
+def _cancelled_mask(series: pd.Series) -> pd.Series:
+    normalized = series.fillna("").astype(str).str.strip().str.casefold()
+    return normalized.isin({"是", "yes", "y", "true", "1", "已取消", "cancelled", "canceled"})
+
+
+def prepare_exam(exam_raw: pd.DataFrame, params: AnalysisParams) -> pd.DataFrame:
+    exam = normalize_columns(exam_raw)
+    require_columns(exam, EXAM_REQUIRED, "考核单")
+
+    exam = exam.copy()
+    exam["京东订单号"] = exam["京东订单号"].astype(str).str.strip()
+    exam["件数"] = pd.to_numeric(exam["件数"], errors="coerce").fillna(0)
+    exam["生产结束时间"] = pd.to_datetime(exam["生产结束时间"], errors="coerce")
+
+    if "拣货完成时间" in exam.columns:
+        exam["考核单拣货完成时间"] = pd.to_datetime(exam["拣货完成时间"], errors="coerce")
+    else:
+        exam["考核单拣货完成时间"] = pd.NaT
+
+    if "是否取消" in exam.columns:
+        exam["是否取消订单"] = _cancelled_mask(exam["是否取消"])
+    else:
+        exam["是否取消订单"] = False
+
+    is_2b = exam["SPB名称"].map(lambda x: _contains_2b(x, params.two_b_keyword))
+    is_oversized = (~is_2b) & (exam["件数"] > params.oversized_order_threshold)
+    exam["订单类型"] = np.select(
+        [is_2b, is_oversized],
+        ["2B", "超大异常单"],
+        default="2C",
+    )
+    exam["到期日期"] = exam["生产结束时间"].dt.date
+
+    # The assessment export should be one row per order. Keep a single record if duplicates appear.
+    exam = exam.sort_values(["京东订单号", "生产结束时间"]).drop_duplicates("京东订单号", keep="last")
+    return exam
+
+
+def parse_location(location: object, params: AnalysisParams) -> tuple[float, float, str, bool]:
+    text = "" if pd.isna(location) else str(location).strip().upper()
+    area_match = re.search(r"(?:^|-)A(\d{1,3})(?:-|$)", text)
+    if area_match is None:
+        # Most records begin directly with Axx, so also support that format.
+        area_match = re.search(r"^A(\d{1,3})(?:-|$)", text)
+    level_match = re.search(r"(?:^|-)L(\d+)(?:-|$)", text)
+
+    area = float(area_match.group(1)) if area_match else np.nan
+    level = float(level_match.group(1)) if level_match else np.nan
+    parsed = bool(area_match and level_match)
+    is_high = bool(
+        parsed
+        and params.high_area_start <= area <= params.high_area_end
+        and level >= params.high_level_start
+    )
+    # Per user's rule: all records not matching the high-level range are ground picking.
+    pick_level = "高层拣选" if is_high else "地面拣选"
+    return area, level, pick_level, parsed
+
+
+def prepare_pick(pick_raw: pd.DataFrame, exam: pd.DataFrame, params: AnalysisParams) -> pd.DataFrame:
+    pick = normalize_columns(pick_raw)
+    require_columns(pick, PICK_REQUIRED, "拣货结果")
+
+    pick = pick.copy()
+    pick["订单号"] = pick["订单号"].astype(str).str.strip()
+    pick["任务单号"] = pick["任务单号"].astype(str).str.strip()
+    pick["实际拣货量"] = pd.to_numeric(pick["实际拣货量"], errors="coerce").fillna(0)
+    pick["任务领取时间"] = pd.to_datetime(pick["任务领取时间"], errors="coerce")
+    pick["拣货完成时间"] = pd.to_datetime(pick["拣货完成时间"], errors="coerce")
+    pick["实际完成日期"] = pick["拣货完成时间"].dt.date
+
+    loc = pick["储位"].map(lambda x: parse_location(x, params))
+    pick[["A区编号", "L层级", "拣选层级", "储位可解析"]] = pd.DataFrame(loc.tolist(), index=pick.index)
+    pick["高层件数"] = np.where(pick["拣选层级"].eq("高层拣选"), pick["实际拣货量"], 0)
+    pick["地面件数"] = np.where(pick["拣选层级"].eq("地面拣选"), pick["实际拣货量"], 0)
+
+    # The picking export also contains a production-end column. Preserve it for comparison,
+    # but use the assessment export as the standard demand deadline after the join.
+    if "生产结束时间" in pick.columns:
+        pick = pick.rename(columns={"生产结束时间": "拣货结果生产结束时间"})
+        pick["拣货结果生产结束时间"] = pd.to_datetime(pick["拣货结果生产结束时间"], errors="coerce")
+
+    order_lookup_cols = [
+        "京东订单号",
+        "件数",
+        "生产结束时间",
+        "到期日期",
+        "SPB名称",
+        "订单类型",
+        "是否取消订单",
     ]
+    lookup = exam[order_lookup_cols].rename(
+        columns={
+            "京东订单号": "订单号",
+            "件数": "订单总件数",
+        }
+    )
+    pick = pick.merge(lookup, on="订单号", how="left", validate="many_to_one")
+    pick["订单匹配状态"] = np.where(pick["生产结束时间"].notna(), "已匹配", "未匹配考核单")
+    # Future orders may not exist in a single-day assessment file. Their deadline is still
+    # available in the picking result, so use it as a fallback for timing analysis.
+    if "拣货结果生产结束时间" in pick.columns:
+        pick["生产结束时间"] = pick["生产结束时间"].combine_first(pick["拣货结果生产结束时间"])
+    pick["到期日期"] = pd.to_datetime(pick["生产结束时间"], errors="coerce").dt.date
+    pick["订单类型"] = pick["订单类型"].fillna("未匹配")
 
-    rename_map: dict[str, str] = {}
-    existing = set(result.columns)
-    for standard_name, aliases in COLUMN_ALIASES.items():
-        if standard_name in existing:
-            continue
-        for alias in aliases:
-            if alias in existing:
-                rename_map[alias] = standard_name
-                break
+    actual_day = pd.to_datetime(pick["拣货完成时间"]).dt.normalize()
+    due_day = pd.to_datetime(pick["生产结束时间"]).dt.normalize()
+    pick["生产日期关系"] = np.select(
+        [due_day.eq(actual_day), due_day.gt(actual_day), due_day.lt(actual_day)],
+        ["当天做当天", "当天做未来", "逾期补做"],
+        default="未知到期时间",
+    )
+    pick["是否按生产结束时间完成"] = np.where(
+        pick["生产结束时间"].isna() | pick["拣货完成时间"].isna(),
+        np.nan,
+        pick["拣货完成时间"] <= pick["生产结束时间"],
+    )
 
-    if rename_map:
-        result = result.rename(columns=rename_map)
-    return result
-
-
-def validate_columns(df: pd.DataFrame) -> list[str]:
-    required = [
-        "姓名",
-        "用户编码",
-        "日期",
-        "考勤组",
-        "计划上班时间",
-        "实际上班时间",
-        "计划下班时间",
-        "实际下班时间",
-    ]
-    return [column for column in required if column not in df.columns]
-
-
-def prepare_data(df: pd.DataFrame, deduplicate: bool = True) -> pd.DataFrame:
-    result = normalize_columns(df)
-
-    text_columns = [
-        "姓名", "用户编码", "考勤组", "班休", "班次名称",
-        "一级供应商", "部门", "岗位", "异常状态",
-    ]
-    for column in text_columns:
-        if column not in result.columns:
-            result[column] = ""
-        result[column] = result[column].fillna("").astype(str).str.strip()
-
-    datetime_columns = [
-        "计划上班时间", "实际上班时间",
-        "计划下班时间", "实际下班时间", "修改时间",
-    ]
-    for column in datetime_columns:
-        if column not in result.columns:
-            result[column] = pd.NaT
-        result[column] = pd.to_datetime(result[column], errors="coerce")
-
-    result["日期"] = pd.to_datetime(result["日期"], errors="coerce").dt.date
-
-    numeric_columns = ["排班时长(时)", "打卡时长(时)", "核算工时(时)"]
-    for column in numeric_columns:
-        if column not in result.columns:
-            result[column] = 0.0
-        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
-
-    if deduplicate:
-        key_columns = [
-            column for column in ["用户编码", "日期", "考勤组"]
-            if column in result.columns
-        ]
-        if key_columns:
-            if result["修改时间"].notna().any():
-                result = result.sort_values("修改时间")
-            result = result.drop_duplicates(subset=key_columns, keep="last")
-
-    return result.reset_index(drop=True)
+    pick["人员键"] = pick["工号"].fillna("").astype(str).str.strip()
+    blank_person = pick["人员键"].eq("") | pick["人员键"].eq("nan")
+    pick.loc[blank_person, "人员键"] = pick.loc[blank_person, "姓名"].fillna("未知人员").astype(str)
+    return pick
 
 
-def _minutes(actual: pd.Timestamp, planned: pd.Timestamp):
-    if pd.isna(actual) or pd.isna(planned):
-        return None
-    return round((actual - planned).total_seconds() / 60, 1)
-
-
-def analyze_attendance(
-    df: pd.DataFrame,
-    thresholds: Thresholds,
-    flag_missing_punches: bool = True,
-    flag_rest_day_punches: bool = True,
-    flag_punch_without_schedule: bool = True,
-) -> pd.DataFrame:
-    """返回仅包含问题员工/日期的异常明细。每个员工每天保留一行。"""
-    data = prepare_data(df, deduplicate=False)
-    output_rows: list[dict] = []
-
-    for _, row in data.iterrows():
-        planned_start = row["计划上班时间"]
-        actual_start = row["实际上班时间"]
-        planned_end = row["计划下班时间"]
-        actual_end = row["实际下班时间"]
-
-        start_diff = _minutes(actual_start, planned_start)
-        end_diff = _minutes(actual_end, planned_end)
-
-        rest_text = f'{row.get("班休", "")} {row.get("班次名称", "")}'
-        is_rest_day = (
-            str(row.get("班休", "")).strip() == "休"
-            or "休息" in rest_text
-        )
-        has_actual_punch = (
-            pd.notna(actual_start)
-            or pd.notna(actual_end)
-            or float(row.get("打卡时长(时)", 0) or 0) > 0
-        )
-        has_planned_shift = pd.notna(planned_start) or pd.notna(planned_end)
-
-        issue_types: list[str] = []
-        issue_details: list[str] = []
-
-        if is_rest_day:
-            if flag_rest_day_punches and has_actual_punch:
-                issue_types.append("休息日打卡")
-                issue_details.append("排班为休息，但存在实际打卡或打卡工时")
+def merge_intervals(intervals: list[tuple[pd.Timestamp, pd.Timestamp]]) -> float:
+    valid = sorted((s, e) for s, e in intervals if pd.notna(s) and pd.notna(e) and e > s)
+    if not valid:
+        return 0.0
+    merged: list[list[pd.Timestamp]] = [[valid[0][0], valid[0][1]]]
+    for start, end in valid[1:]:
+        if start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
         else:
-            if not has_planned_shift:
-                if flag_punch_without_schedule and has_actual_punch:
-                    issue_types.append("有打卡无排班")
-                    issue_details.append("存在实际打卡，但未配置计划班次")
-            else:
-                no_start = pd.isna(actual_start)
-                no_end = pd.isna(actual_end)
-
-                if flag_missing_punches and no_start and no_end:
-                    issue_types.append("整班无打卡")
-                    issue_details.append("有计划班次，但上下班均无实际打卡")
-                else:
-                    if flag_missing_punches and pd.notna(planned_start) and no_start:
-                        issue_types.append("缺上班卡")
-                        issue_details.append("有计划上班时间，但无实际上班打卡")
-                    if flag_missing_punches and pd.notna(planned_end) and no_end:
-                        issue_types.append("缺下班卡")
-                        issue_details.append("有计划下班时间，但无实际下班打卡")
-
-                if start_diff is not None:
-                    if start_diff > thresholds.late_start:
-                        issue_types.append("迟到超阈值")
-                        issue_details.append(f"实际上班晚于计划 {start_diff:g} 分钟")
-                    elif start_diff < -thresholds.early_start:
-                        issue_types.append("提前上班超阈值")
-                        issue_details.append(f"实际上班早于计划 {abs(start_diff):g} 分钟")
-
-                if end_diff is not None:
-                    if end_diff < -thresholds.early_leave:
-                        issue_types.append("早退超阈值")
-                        issue_details.append(f"实际下班早于计划 {abs(end_diff):g} 分钟")
-                    elif end_diff > thresholds.late_leave:
-                        issue_types.append("晚下班超阈值")
-                        issue_details.append(f"实际下班晚于计划 {end_diff:g} 分钟")
-
-        if not issue_types:
-            continue
-
-        output_rows.append(
-            {
-                "日期": row["日期"],
-                "考勤组": row.get("考勤组", ""),
-                "用户编码": row.get("用户编码", ""),
-                "姓名": row.get("姓名", ""),
-                "一级供应商": row.get("一级供应商", ""),
-                "部门": row.get("部门", ""),
-                "岗位": row.get("岗位", ""),
-                "班次名称": row.get("班次名称", ""),
-                "班休": row.get("班休", ""),
-                "计划上班时间": planned_start,
-                "实际上班时间": actual_start,
-                "上班偏差(分钟)": start_diff,
-                "计划下班时间": planned_end,
-                "实际下班时间": actual_end,
-                "下班偏差(分钟)": end_diff,
-                "排班时长(时)": row.get("排班时长(时)", 0),
-                "打卡时长(时)": row.get("打卡时长(时)", 0),
-                "核算工时(时)": row.get("核算工时(时)", 0),
-                "原系统异常状态": row.get("异常状态", ""),
-                "异常类型": "；".join(issue_types),
-                "异常说明": "；".join(issue_details),
-                "来源文件": row.get("来源文件", ""),
-            }
-        )
-
-    columns = [
-        "日期", "考勤组", "用户编码", "姓名", "一级供应商",
-        "部门", "岗位", "班次名称", "班休",
-        "计划上班时间", "实际上班时间", "上班偏差(分钟)",
-        "计划下班时间", "实际下班时间", "下班偏差(分钟)",
-        "排班时长(时)", "打卡时长(时)", "核算工时(时)",
-        "原系统异常状态", "异常类型", "异常说明", "来源文件",
-    ]
-    result = pd.DataFrame(output_rows, columns=columns)
-
-    if result.empty:
-        return result
-
-    return result.sort_values(
-        ["日期", "考勤组", "姓名", "用户编码"],
-        na_position="last",
-    ).reset_index(drop=True)
+            merged.append([start, end])
+    seconds = sum((end - start).total_seconds() for start, end in merged)
+    return seconds / 3600
 
 
-def build_summary(result: pd.DataFrame) -> pd.DataFrame:
-    if result.empty:
-        return pd.DataFrame(
-            columns=["日期", "考勤组", "异常人次", "异常员工数"]
-        )
-
-    return (
-        result.groupby(["日期", "考勤组"], dropna=False)
+def build_task_table(pick_filtered: pd.DataFrame, params: AnalysisParams) -> pd.DataFrame:
+    tasks = (
+        pick_filtered.groupby(["人员键", "工号", "姓名", "任务单号"], dropna=False)
         .agg(
-            异常人次=("用户编码", "size"),
-            异常员工数=("用户编码", "nunique"),
+            任务开始=("任务领取时间", "min"),
+            任务结束=("拣货完成时间", "max"),
+            任务件数=("实际拣货量", "sum"),
+            订单数=("订单号", "nunique"),
+            高层件数=("高层件数", "sum"),
         )
         .reset_index()
-        .sort_values(["日期", "异常人次", "考勤组"], ascending=[True, False, True])
     )
+    tasks["任务分钟"] = (tasks["任务结束"] - tasks["任务开始"]).dt.total_seconds() / 60
+    tasks["任务时长有效"] = tasks["任务分钟"].gt(0) & tasks["任务分钟"].le(params.max_valid_task_minutes)
+    tasks["异常原因"] = np.select(
+        [tasks["任务分钟"].isna(), tasks["任务分钟"].le(0), tasks["任务分钟"].gt(params.max_valid_task_minutes)],
+        ["缺少开始或结束时间", "结束时间不晚于开始时间", "超过任务时长阈值"],
+        default="",
+    )
+    return tasks
+
+
+def build_person_productivity(pick_filtered: pd.DataFrame, tasks: pd.DataFrame) -> pd.DataFrame:
+    if pick_filtered.empty:
+        return pd.DataFrame()
+
+    people = (
+        pick_filtered.groupby("人员键", dropna=False)
+        .agg(
+            工号=("工号", "first"),
+            姓名=("姓名", "first"),
+            实际件数=("实际拣货量", "sum"),
+            订单数=("订单号", "nunique"),
+            任务数=("任务单号", "nunique"),
+            高层件数=("高层件数", "sum"),
+            地面件数=("地面件数", "sum"),
+            二B件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("2B")].sum()),
+            二C件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("2C")].sum()),
+            超大异常件数=("实际拣货量", lambda s: s[pick_filtered.loc[s.index, "订单类型"].eq("超大异常单")].sum()),
+        )
+        .reset_index()
+    )
+
+    valid_tasks = tasks[tasks["任务时长有效"]].copy()
+    hours_by_person = {}
+    for person, group in valid_tasks.groupby("人员键"):
+        intervals = list(zip(group["任务开始"], group["任务结束"]))
+        hours_by_person[person] = merge_intervals(intervals)
+
+    people["有效操作工时"] = people["人员键"].map(hours_by_person).fillna(0)
+    people["件数人效"] = np.where(
+        people["有效操作工时"] > 0,
+        people["实际件数"] / people["有效操作工时"],
+        np.nan,
+    )
+    people["高层件数占比"] = np.where(people["实际件数"] > 0, people["高层件数"] / people["实际件数"], 0)
+    people["2B件数占比"] = np.where(people["实际件数"] > 0, people["二B件数"] / people["实际件数"], 0)
+    people["2C件数占比"] = np.where(people["实际件数"] > 0, people["二C件数"] / people["实际件数"], 0)
+    return people.sort_values("件数人效", ascending=False, na_position="last")
+
+
+def demand_summary(exam: pd.DataFrame, due_date: date) -> dict[str, float]:
+    valid = exam[~exam["是否取消订单"]].copy()
+    due = valid[valid["到期日期"].eq(due_date)].copy()
+    if due.empty:
+        return {
+            "到期订单数": 0,
+            "到期件数": 0,
+            "开班前已拣件数": 0,
+            "开班时剩余件数": 0,
+            "到期日前完成件数": 0,
+            "按时完成件数": 0,
+            "超过生产结束时间件数": 0,
+        }
+
+    start = pd.Timestamp(due_date)
+    completion = due["考核单拣货完成时间"]
+    early_before_day = completion.notna() & completion.lt(start)
+    by_due_time = completion.notna() & completion.le(due["生产结束时间"])
+    late_or_open = completion.isna() | completion.gt(due["生产结束时间"])
+
+    return {
+        "到期订单数": float(due["京东订单号"].nunique()),
+        "到期件数": float(due["件数"].sum()),
+        "开班前已拣件数": float(due.loc[early_before_day, "件数"].sum()),
+        "开班时剩余件数": float(due.loc[~early_before_day, "件数"].sum()),
+        "到期日前完成件数": float(due.loc[early_before_day, "件数"].sum()),
+        "按时完成件数": float(due.loc[by_due_time, "件数"].sum()),
+        "超过生产结束时间件数": float(due.loc[late_or_open, "件数"].sum()),
+    }
+
+
+def order_level_actual(pick_filtered: pd.DataFrame) -> pd.DataFrame:
+    if pick_filtered.empty:
+        return pd.DataFrame()
+    orders = (
+        pick_filtered.groupby("订单号", dropna=False)
+        .agg(
+            订单类型=("订单类型", "first"),
+            SPB名称=("SPB名称", "first"),
+            生产结束时间=("生产结束时间", "first"),
+            实际完成时间=("拣货完成时间", "max"),
+            实际件数=("实际拣货量", "sum"),
+            高层件数=("高层件数", "sum"),
+            地面件数=("地面件数", "sum"),
+            任务数=("任务单号", "nunique"),
+        )
+        .reset_index()
+    )
+    orders["高层件数占比"] = np.where(orders["实际件数"] > 0, orders["高层件数"] / orders["实际件数"], 0)
+    orders["订单储位结构"] = np.select(
+        [orders["高层件数"].eq(0), orders["地面件数"].eq(0)],
+        ["纯地面订单", "纯高层订单"],
+        default="高低层混合订单",
+    )
+    actual_day = orders["实际完成时间"].dt.normalize()
+    due_day = orders["生产结束时间"].dt.normalize()
+    orders["生产日期关系"] = np.select(
+        [due_day.eq(actual_day), due_day.gt(actual_day), due_day.lt(actual_day)],
+        ["当天做当天", "当天做未来", "逾期补做"],
+        default="未知到期时间",
+    )
+    return orders
