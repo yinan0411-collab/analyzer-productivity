@@ -48,7 +48,8 @@ with st.sidebar:
     )
 
     st.header("分析规则")
-    two_b_keyword = st.text_input("2B识别关键词", value="2B")
+    two_b_keyword = "2B"
+    st.caption("2B固定识别规则：SPB名称中包含‘2B’字样（不区分大小写）。")
     oversized_threshold = st.number_input("非2B超大异常单阈值（件/订单）", min_value=1, value=500, step=50)
     high_area_start = st.number_input("高层区域起始 A", min_value=0, value=1, step=1)
     high_area_end = st.number_input("高层区域结束 A", min_value=0, value=36, step=1)
@@ -105,18 +106,53 @@ if not actual_dates:
     st.error("拣货结果中没有可识别的‘拣货完成时间’。")
     st.stop()
 
-filter_col1, filter_col2 = st.columns(2)
+filter_col1, filter_col2, filter_col3 = st.columns(3)
 with filter_col1:
     analysis_date = st.selectbox("实际拣货分析日期", actual_dates, index=len(actual_dates) - 1, format_func=lambda x: str(x))
 with filter_col2:
     default_due_index = due_dates.index(analysis_date) if analysis_date in due_dates else len(due_dates) - 1
     demand_date = st.selectbox("应生产需求日期", due_dates, index=max(default_due_index, 0), format_func=lambda x: str(x))
+with filter_col3:
+    order_filter_label = st.selectbox(
+        "订单类型筛选",
+        ["全部订单", "仅2B", "仅2C", "仅超大异常单"],
+        index=0,
+    )
 
-pick_day = pick[pick["实际完成日期"].eq(analysis_date)].copy()
+order_filter_map = {
+    "全部订单": None,
+    "仅2B": "2B",
+    "仅2C": "2C",
+    "仅超大异常单": "超大异常单",
+}
+selected_order_type = order_filter_map[order_filter_label]
+
+exam_scope = exam.copy()
+pick_scope = pick.copy()
+if selected_order_type is not None:
+    exam_scope = exam_scope[exam_scope["订单类型"].eq(selected_order_type)].copy()
+    pick_scope = pick_scope[pick_scope["订单类型"].eq(selected_order_type)].copy()
+
+pick_day = pick_scope[pick_scope["实际完成日期"].eq(analysis_date)].copy()
 orders_day = order_level_actual(pick_day)
 tasks_day = build_task_table(pick_day, params)
 people_day = build_person_productivity(pick_day, tasks_day)
-demand = demand_summary(exam, demand_date)
+demand = demand_summary(exam_scope, demand_date)
+
+st.caption(
+    f"当前分析范围：{order_filter_label}。2B判定为SPB名称中包含‘2B’字样（不区分大小写）。"
+)
+
+if pick_day.empty:
+    st.warning(f"{analysis_date} 在“{order_filter_label}”范围内没有拣货完成记录。你仍可以查看该类型当天的应生产需求。")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("到期订单", f"{demand['到期订单数']:,.0f}")
+    d2.metric("到期件数", f"{demand['到期件数']:,.0f}")
+    d3.metric("开班前已拣", f"{demand['开班前已拣件数']:,.0f}")
+    d4.metric("开班时剩余", f"{demand['开班时剩余件数']:,.0f}")
+    d5.metric("超过生产结束时间/未完成", f"{demand['超过生产结束时间件数']:,.0f}")
+    st.info("可切换其他实际拣货日期，或上传包含该订单类型的更多拣货结果文件。")
+    st.stop()
 
 actual_units = float(pick_day["实际拣货量"].sum())
 actual_orders = int(pick_day["订单号"].nunique())
@@ -274,7 +310,7 @@ with tab_people:
 with tab_exceptions:
     st.subheader("需要人工确认的异常")
     e1, e2, e3, e4 = st.columns(4)
-    oversized = exam[(~exam["是否取消订单"]) & exam["订单类型"].eq("超大异常单")]
+    oversized = exam_scope[(~exam_scope["是否取消订单"]) & exam_scope["订单类型"].eq("超大异常单")]
     unmatched = pick_day[pick_day["订单匹配状态"].eq("未匹配考核单")]
     unparsed = pick_day[~pick_day["储位可解析"]]
     abnormal_tasks = tasks_day[~tasks_day["任务时长有效"]]
@@ -301,25 +337,25 @@ with tab_export:
     st.download_button(
         "下载员工人效 CSV",
         people_day.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=f"拣货员工人效_{analysis_date}.csv",
+        file_name=f"拣货员工人效_{analysis_date}_{order_filter_label}.csv",
         mime="text/csv",
     )
     st.download_button(
         "下载订单级分析 CSV",
         orders_day.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=f"拣货订单分析_{analysis_date}.csv",
+        file_name=f"拣货订单分析_{analysis_date}_{order_filter_label}.csv",
         mime="text/csv",
     )
     st.download_button(
         "下载任务级分析 CSV",
         tasks_day.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=f"拣货任务分析_{analysis_date}.csv",
+        file_name=f"拣货任务分析_{analysis_date}_{order_filter_label}.csv",
         mime="text/csv",
     )
     st.download_button(
         "下载明细关联结果 CSV",
         pick_day.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=f"拣货关联明细_{analysis_date}.csv",
+        file_name=f"拣货关联明细_{analysis_date}_{order_filter_label}.csv",
         mime="text/csv",
     )
 
